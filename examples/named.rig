@@ -1,0 +1,27 @@
+# Multiple resources of the same type must be referenced by name.
+# Each verb grants exactly the actions it implies - no separate
+# "actions" attribute needed.
+
+ScaledServer web {
+  ami           = "ami-0123456789abcdef0"
+  instance_type = "t2.nano"
+  region        = "us-east-1"
+}
+
+ScaledServer worker {
+  ami           = "ami-0123456789abcdef0"
+  instance_type = "t2.nano"
+}
+
+Bucket uploads {
+  bucket = "example-app.user"
+}
+
+Bucket logs {
+  bucket = "example-app.logs"
+}
+
+web reads uploads
+web writes uploads
+
+worker writes logs

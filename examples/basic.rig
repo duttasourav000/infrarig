@@ -1,0 +1,14 @@
+# A single auto-scaled server that reads and writes a bucket.
+
+ScaledServer app {
+  ami           = "ami-0123456789abcdef0"
+  instance_type = "t2.nano"
+  region        = "us-east-1"
+}
+
+Bucket uploads {
+  bucket = "example-app.user"
+}
+
+ScaledServer reads Bucket
+ScaledServer writes Bucket
