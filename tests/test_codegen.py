@@ -9,7 +9,7 @@ EXAMPLES = Path(__file__).resolve().parent.parent / "examples"
 
 class CodegenTests(unittest.TestCase):
     def test_basic_example_generates_iam_s3_and_asg(self):
-        program = parse((EXAMPLES / "basic.rig").read_text())
+        program = parse((EXAMPLES / "basic" / "basic.rig").read_text())
         output = generate(program)
 
         self.assertIn('resource "aws_s3_bucket" "uploads"', output)
@@ -27,6 +27,26 @@ class CodegenTests(unittest.TestCase):
         self.assertIn('resource "aws_autoscaling_group" "app"', output)
         self.assertIn("aws_launch_template.app.name", output)
         self.assertNotIn("aws_instance", output)
+
+    def test_multiregion_example_mirrors_component_across_regions(self):
+        output = generate(parse((EXAMPLES / "multiregion" / "multiregion.rig").read_text()))
+
+        self.assertIn('provider "aws" {\n  alias  = "us_west_2"', output)
+        # The server and its copy share one role.
+        self.assertEqual(output.count('resource "aws_iam_role" "app_role"'), 1)
+        self.assertIn('resource "aws_autoscaling_group" "web_usw2_app"', output)
+        self.assertIn('bucket = "example-app.uploads-us-west-2"', output)
+        # One replication config per direction, each in its source bucket's region
+        # and waiting on versioning for both buckets.
+        use1 = output.split('resource "aws_s3_bucket_replication_configuration" "uploads"')[1].split("rule {")[0]
+        usw2 = output.split('resource "aws_s3_bucket_replication_configuration" "web_usw2_uploads"')[1]
+        usw2 = usw2.split("rule {")[0]
+        self.assertNotIn("provider", use1)
+        self.assertIn("provider = aws.us_west_2", usw2)
+        for config in (use1, usw2):
+            self.assertRegex(config, r"aws_s3_bucket_versioning\.uploads\b")
+            self.assertIn("aws_s3_bucket_versioning.web_usw2_uploads", config)
+        self.assertNotIn("var.subnet_ids", output)
 
     def test_reads_does_not_grant_write_or_list(self):
         source = """
@@ -175,6 +195,57 @@ class CodegenTests(unittest.TestCase):
         self.assertIn('resource "aws_s3_bucket_replication_configuration" "uploads"', output)
         self.assertIn("s3:ReplicateObject", output)
         self.assertIn('provider "aws" {\n  alias  = "us_west_2"', output)
+
+    def test_replication_config_uses_source_bucket_provider(self):
+        source = """
+        Bucket uploads { bucket = "example.com.user", region = "ap-southeast-1" }
+        Bucket uploads_uw2 { bucket = "example.com.user-uw2", region = "us-west-2" }
+        uploads_uw2 replicates uploads
+        """
+        output = generate(parse(source))
+        config = output.split('resource "aws_s3_bucket_replication_configuration" "uploads_uw2"')[1]
+        self.assertIn("provider = aws.us_west_2", config.split("rule {")[0])
+
+    def test_bucket_mirrors_bucket_replicates_both_ways(self):
+        source = """
+        Bucket uploads1 { bucket = "example.com.user", region = "ap-southeast-1" }
+        Bucket uploads2 { bucket = "example.com.user-uw2", region = "us-west-2" }
+        uploads1 mirrors uploads2
+        """
+        output = generate(parse(source))
+        self.assertIn('resource "aws_s3_bucket_replication_configuration" "uploads1"', output)
+        self.assertIn('resource "aws_s3_bucket_replication_configuration" "uploads2"', output)
+        self.assertIn('resource "aws_iam_role" "uploads1_replication"', output)
+        self.assertIn('resource "aws_iam_role" "uploads2_replication"', output)
+        self.assertIn('id     = "replicate-to-uploads2"', output)
+        self.assertIn('id     = "replicate-to-uploads1"', output)
+
+    def test_mirror_overlapping_replicates_raises(self):
+        source = """
+        Bucket a { bucket = "a", region = "us-east-1" }
+        Bucket b { bucket = "b", region = "us-west-2" }
+        a mirrors b
+        b replicates a
+        """
+        with self.assertRaisesRegex(CodegenError, "already replicates"):
+            generate(parse(source))
+
+    def test_bucket_mirrors_itself_raises(self):
+        source = """
+        Bucket a { bucket = "a", region = "us-east-1" }
+        a mirrors a
+        """
+        with self.assertRaisesRegex(CodegenError, "itself"):
+            generate(parse(source))
+
+    def test_mirror_rejects_attrs(self):
+        source = """
+        Bucket a { bucket = "a", region = "us-east-1" }
+        Bucket b { bucket = "b", region = "us-west-2" }
+        a mirrors b { role_name = "x" }
+        """
+        with self.assertRaises(CodegenError):
+            generate(parse(source))
 
     def test_mismatched_target_types_raises(self):
         source = """

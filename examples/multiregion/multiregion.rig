@@ -1,0 +1,38 @@
+# One app deployed in two regions, written once.
+#
+# `app` and `uploads` are declared for us-east-1 exactly as in a
+# single-region program. `Component web` groups them, and
+# `web mirrors "us-west-2" as usw2` copies the whole group into us-west-2.
+# (Without `as usw2` the copies would be named web_us_west_2_*.)
+#
+# - web_usw2_app: a second launch template + ASG in us-west-2, sharing
+#   app's IAM role. AMIs and subnets are region-specific, so they must be
+#   overridden.
+# - web_usw2_uploads: a second bucket, named "<bucket>-us-west-2" by
+#   default, that mirrors `uploads` (replication in both directions).
+# - the relations: web_usw2_app reads and writes web_usw2_uploads, its
+#   own region's bucket.
+
+ScaledServer app {
+  ami           = "ami-0123456789abcdef0"
+  instance_type = "t2.nano"
+  region        = "us-east-1"
+  subnet_ids    = ["subnet-0123456789abcdef0"]
+}
+
+Bucket uploads {
+  bucket = "example-app.uploads"
+  region = "us-east-1"
+}
+
+app reads uploads
+app writes uploads
+
+Component web [app, uploads]
+
+web mirrors "us-west-2" as usw2 {
+  app {
+    ami        = "ami-0fedcba9876543210"
+    subnet_ids = ["subnet-0fedcba9876543210"]
+  }
+}

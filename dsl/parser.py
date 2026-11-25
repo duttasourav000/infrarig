@@ -3,25 +3,30 @@
 Grammar (informal):
 
     program    := statement*
-    statement  := relation_stmt | resource_decl
-    relation_stmt := IDENT VERB target block?
+    statement  := relation_stmt | component_decl | resource_decl
+    relation_stmt := IDENT VERB (target | STRING ("as" IDENT)?) block?
     target     := IDENT | "[" IDENT ("," IDENT)* "]"
+    component_decl := "Component" IDENT target
     resource_decl := IDENT IDENT block?
-    block      := "{" (IDENT "=" value ","?)* "}"
+    block      := "{" ((IDENT "=" value | IDENT block) ","?)* "}"
     value      := STRING | NUMBER | BOOL | "[" (value ","?)* "]"
 
 A statement is disambiguated by its second token: if it is one of the verb
 keywords, the statement is a relation; otherwise the second identifier is
-a resource name and the first is its type.
+a resource (or component) name and the first is its type.
+
+A nested `IDENT block` inside a block parses to a dict. Only a component
+mirror uses it (per-member overrides); the expansion step rejects it
+anywhere else.
 """
 from __future__ import annotations
 
 from typing import Any
 
-from .ast_nodes import Program, RelationStmt, ResourceDecl
+from .ast_nodes import ComponentDecl, Program, RelationStmt, ResourceDecl
 from .lexer import Token, tokenize
 
-VERBS = {"reads", "writes", "replicates"}
+VERBS = {"reads", "writes", "replicates", "mirrors"}
 
 
 class ParseError(Exception):
@@ -68,14 +73,35 @@ class Parser:
 
         if second.kind == "IDENT" and second.value in VERBS:
             self.advance()
-            right = self._parse_target()
+            literal_target = self.peek().kind == "STRING"
+            alias = None
+            if literal_target:
+                right = [_decode_string(self.advance().value[1:-1])]
+                if self.peek().kind == "IDENT" and self.peek().value == "as":
+                    self.advance()
+                    alias = self.expect("IDENT").value
+            else:
+                right = self._parse_target()
             attrs = self._parse_optional_block()
             program.relations.append(
-                RelationStmt(left=first.value, verb=second.value, right=right, attrs=attrs, line=first.line)
+                RelationStmt(
+                    left=first.value,
+                    verb=second.value,
+                    right=right,
+                    attrs=attrs,
+                    line=first.line,
+                    literal_target=literal_target,
+                    alias=alias,
+                )
             )
             return
 
         name = self.expect("IDENT")
+        if first.value == "Component":
+            members = self._parse_target()
+            program.components.append(ComponentDecl(name=name.value, members=members, line=first.line))
+            return
+
         attrs = self._parse_optional_block()
         program.resources.append(
             ResourceDecl(type=first.value, name=name.value, attrs=attrs, line=first.line)
@@ -100,8 +126,11 @@ class Parser:
         attrs: dict[str, Any] = {}
         while self.peek().kind != "RBRACE":
             key = self.expect("IDENT")
-            self.expect("EQUALS")
-            attrs[key.value] = self._parse_value()
+            if self.peek().kind == "LBRACE":
+                attrs[key.value] = self._parse_optional_block()
+            else:
+                self.expect("EQUALS")
+                attrs[key.value] = self._parse_value()
             if self.peek().kind == "COMMA":
                 self.advance()
         self.expect("RBRACE")

@@ -4,3 +4,9 @@ __pycache__/
 
 # Build output
 output/
+
+# OpenTofu working files
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*

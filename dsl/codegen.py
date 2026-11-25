@@ -6,7 +6,8 @@ a `value` attribute it's created here too; a raw HCL expression, e.g.
 referencing `var.ssm_params`, not a quoted literal - keeps real values
 out of the DSL source. Without `value`, it's assumed to be managed
 elsewhere and only the IAM read grant is generated).
-Verbs: `reads` (Bucket/Secret/Registry), `writes` (Bucket), `replicates` (Bucket -> Bucket, cross-region).
+Verbs: `reads` (Bucket/Secret/Registry), `writes` (Bucket), `replicates` (Bucket -> Bucket, cross-region),
+`mirrors` (Bucket <-> Bucket: `replicates` in both directions).
 
 `ScaledServer` compiles to a launch template + autoscaling group (the
 shape used in modules/regional/main.tf), not a single instance. Multiple
@@ -30,6 +31,8 @@ from collections import defaultdict
 from typing import Any
 
 from .ast_nodes import Program, RelationStmt, ResourceDecl
+from .components import expand_components
+from .errors import CodegenError
 
 SUPPORTED_TYPES = {"ScaledServer", "Bucket", "Registry", "Secret"}
 
@@ -50,10 +53,6 @@ _ECR_PULL_ACTIONS = [
     "ecr:BatchGetImage",
     "ecr:BatchCheckLayerAvailability",
 ]
-
-
-class CodegenError(Exception):
-    pass
 
 
 def _sanitize(value: str) -> str:
@@ -486,6 +485,7 @@ def _emit_bucket_replication(
     role_name: str,
     policy_name: str,
     rule_ids: dict[str, str],
+    primary_region: str | None,
 ) -> list[str]:
     trust = _emit_assume_role_trust("s3.amazonaws.com")
     blocks = [
@@ -542,11 +542,14 @@ def _emit_bucket_replication(
             f"    }}\n"
             f"  }}"
         )
+    # S3 requires versioning on the source and every destination before a
+    # replication config can be created.
+    versioning_deps = ", ".join(f"aws_s3_bucket_versioning.{b.name}" for b in [source, *destinations])
     blocks.append(
         f'resource "aws_s3_bucket_replication_configuration" "{source.name}" {{\n'
-        f"  depends_on = [aws_s3_bucket_versioning.{source.name}]\n\n"
+        f"  depends_on = [{versioning_deps}]\n\n"
         f"  role   = aws_iam_role.{role_address}.arn\n"
-        f"  bucket = aws_s3_bucket.{source.name}.id\n\n"
+        f"  bucket = aws_s3_bucket.{source.name}.id{_provider_meta(source, primary_region)}\n\n"
         + "\n\n".join(rules)
         + "\n}"
     )
@@ -554,6 +557,7 @@ def _emit_bucket_replication(
 
 
 def generate(program: Program) -> str:
+    program = expand_components(program)
     for decl in program.resources:
         if decl.type not in SUPPORTED_TYPES:
             raise CodegenError(
@@ -581,11 +585,19 @@ def generate(program: Program) -> str:
             ("ScaledServer", "reads", "Secret"),
             ("ScaledServer", "reads", "Registry"),
             ("Bucket", "replicates", "Bucket"),
+            ("Bucket", "mirrors", "Bucket"),
         }:
             raise CodegenError(
                 f"line {stmt.line}: '{stmt.verb}' from {left.type} to {target_type} is not supported"
             )
-        allowed_attrs = {"name", "role_name", "rule_id"} if key == ("Bucket", "replicates", "Bucket") else {"name"}
+        if key == ("Bucket", "replicates", "Bucket"):
+            allowed_attrs = {"name", "role_name", "rule_id"}
+        elif key == ("Bucket", "mirrors", "Bucket"):
+            # Two roles/configs come out of one statement, so per-statement
+            # names would collide; use `replicates` twice to customize them.
+            allowed_attrs = set()
+        else:
+            allowed_attrs = {"name"}
         unknown_attrs = set(stmt.attrs) - allowed_attrs
         if unknown_attrs:
             raise CodegenError(f"line {stmt.line}: unknown relation attribute(s): {', '.join(unknown_attrs)}")
@@ -682,9 +694,22 @@ def generate(program: Program) -> str:
     replications: dict[str, list[ResourceDecl]] = defaultdict(list)
     replication_overrides: dict[str, dict[str, Any]] = {}
     rule_ids_by_source: dict[str, dict[str, str]] = defaultdict(dict)
+
+    def add_replication(source: ResourceDecl, dest: ResourceDecl, stmt: RelationStmt) -> None:
+        if source.name == dest.name:
+            raise CodegenError(f"line {stmt.line}: bucket '{source.name}' can't replicate to itself")
+        if any(d.name == dest.name for d in replications[source.name]):
+            raise CodegenError(f"line {stmt.line}: '{source.name}' already replicates to '{dest.name}'")
+        replications[source.name].append(dest)
+
     for left, verb, targets, stmt in resolved:
-        if left.type == "Bucket" and verb == "replicates":
-            replications[left.name].extend(targets)
+        if left.type == "Bucket" and verb == "mirrors":
+            for t in targets:
+                add_replication(left, t, stmt)
+                add_replication(t, left, stmt)
+        elif left.type == "Bucket" and verb == "replicates":
+            for t in targets:
+                add_replication(left, t, stmt)
             overrides = replication_overrides.setdefault(left.name, {})
             if "role_name" in stmt.attrs:
                 overrides["role_name"] = stmt.attrs["role_name"]
@@ -701,7 +726,13 @@ def generate(program: Program) -> str:
         policy_name = overrides.get("policy_name", role_address)
         blocks.extend(
             _emit_bucket_replication(
-                source, destinations, role_address, role_name, policy_name, rule_ids_by_source[source_name]
+                source,
+                destinations,
+                role_address,
+                role_name,
+                policy_name,
+                rule_ids_by_source[source_name],
+                primary_region,
             )
         )
 

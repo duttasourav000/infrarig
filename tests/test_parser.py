@@ -53,6 +53,22 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(len(program.resources), 2)
         self.assertEqual(len(program.relations), 2)
 
+    def test_component_decl(self):
+        program = parse("Component web [app, uploads]")
+        self.assertEqual(len(program.components), 1)
+        self.assertEqual((program.components[0].name, program.components[0].members), ("web", ["app", "uploads"]))
+        self.assertEqual(program.resources, [])
+
+    def test_nested_block_parses_to_dict(self):
+        program = parse('web mirrors "us-west-2" {\n  app { ami = "ami-1" }\n}')
+        stmt = program.relations[0]
+        self.assertEqual(stmt.attrs, {"app": {"ami": "ami-1"}})
+        self.assertEqual((stmt.right, stmt.literal_target, stmt.alias), (["us-west-2"], True, None))
+
+    def test_mirror_region_with_alias(self):
+        stmt = parse('web mirrors "us-west-2" as usw2').relations[0]
+        self.assertEqual((stmt.right, stmt.literal_target, stmt.alias), (["us-west-2"], True, "usw2"))
+
     def test_missing_equals_raises(self):
         with self.assertRaises(ParseError):
             parse('Bucket uploads {\n  bucket "x"\n}')

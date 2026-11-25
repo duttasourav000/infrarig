@@ -11,7 +11,7 @@ generated header says as much: review before applying.
 
 ## Status
 
-Four resource types and three verbs. Codegen only targets AWS, but the type
+Four resource types and four verbs. Codegen only targets AWS, but the type
 names are meant to stay cloud-agnostic.
 
 | Type           | Compiles to                                                            |
@@ -30,6 +30,7 @@ Supported relations (anything else is a compile error):
 | `ScaledServer reads Secret`       | `secretsmanager:GetSecretValue`                              |
 | `ScaledServer reads Registry`     | `ecr:GetAuthorizationToken` + image pull actions             |
 | `Bucket replicates Bucket`        | S3 replication role, policy and `aws_s3_bucket_replication_configuration` |
+| `Bucket mirrors Bucket`           | Bidirectional replication: the same as `replicates` in both directions |
 
 ## Syntax
 
@@ -59,7 +60,7 @@ ScaledServer writes Bucket
 - A target can be a list: `app reads [uploads, logs]`. All targets in a
   list must be the same type, and they share one generated policy.
 - Each relation generates its own scoped IAM policy. Need read and write?
-  Write both statements (see [examples/basic.rig](examples/basic.rig)).
+  Write both statements (see [examples/basic](examples/basic)).
 
 ### Resource attributes
 
@@ -93,6 +94,77 @@ ScaledServer writes Bucket
   `<server>-<verb>-<targets>`). Duplicate names are an error.
 - For `replicates` only: `role_name` (default `<source>-replication`) and
   `rule_id` (default `replicate-to-<dest>`).
+- `mirrors` takes no attributes. `a mirrors b` is shorthand for
+  `a replicates b` plus `b replicates a`, with default names. To customize
+  names, write the two `replicates` statements instead. Declaring the same
+  source/destination pair twice (e.g. `a mirrors b` and `b replicates a`)
+  is an error.
+
+### Components: copying a group of resources to another region
+
+A `Component` groups resources so you can copy all of them into another
+region in one statement, and override only the values that differ there:
+
+```
+ScaledServer app {
+  ami        = "ami-0123456789abcdef0"
+  region     = "us-east-1"
+  subnet_ids = ["subnet-0123456789abcdef0"]
+}
+
+Bucket uploads {
+  bucket = "example-app.uploads"
+  region = "us-east-1"
+}
+
+app reads uploads
+app writes uploads
+
+Component web [app, uploads]
+
+web mirrors "us-west-2" {
+  app { ami = "ami-0fedcba9876543210", subnet_ids = ["subnet-0fedcba9876543210"] }
+}
+```
+
+`web mirrors "us-west-2"` creates a copy of each member named
+`<component>_<label>_<member>`. The label is the region as an identifier,
+so the copies here are `web_us_west_2_app` and `web_us_west_2_uploads`.
+Add `as <name>` to choose a shorter label:
+`web mirrors "us-west-2" as usw2` gives `web_usw2_app` and
+`web_usw2_uploads`.
+
+- **Attributes** are copied from the original, then the member's override
+  block (`app { ... }`) is applied on top. The region comes from the
+  mirror's target, so members can't set `region`.
+- **Relations** whose left side is a member are copied, with each member
+  replaced by its copy. So `web_us_west_2_app` reads and writes
+  `web_us_west_2_uploads`. A relation to an outside resource, such as
+  `app writes logs`, is copied as `web_us_west_2_app writes logs`.
+  Relations that come from outside into a member are not copied. A copied
+  relation's `name` / `role_name` gets `-<component>_<label>` appended.
+- **Buckets mirror automatically.** Each `Bucket` member and all its copies
+  replicate to each other in both directions, so with three regions every
+  bucket replicates to the other two.
+- **AWS names:** a copied `ScaledServer` keeps the original's `name`,
+  `role_name` and `log_group` by default. Launch template and ASG names are
+  per-region, and keeping the role means every copy shares one IAM role. A
+  copied `Bucket`'s `bucket` defaults to `<bucket>-<region>`, because S3
+  names are global. Override any of these in the member block.
+- **References:** `web.us_west_2.app` (or `web.usw2.app` with
+  `as usw2`) refers to a copy and `web.app` to the original, e.g.
+  `web.us_west_2.app reads secrets`.
+
+Rules:
+
+- Members must be declared by name, have their own `region`, and be a
+  `ScaledServer` or `Bucket`. A resource can belong to only one component.
+- The mirror's region must differ from each member's region.
+- A copied `ScaledServer` must override `ami` and `subnet_ids`, because both
+  are region-specific. It must also override `security_group_ids` if the
+  original sets it.
+- Mirror a component to as many regions as you like, one region per
+  statement, but each region only once.
 
 ### Regions
 
@@ -125,8 +197,8 @@ The package is imported as `infrarig`, so run these from the directory
 that contains the `infrarig/` checkout:
 
 ```bash
-python3 -m infrarig.dsl.cli infrarig/examples/basic.rig
-python3 -m infrarig.dsl.cli infrarig/examples/named.rig -o /tmp/named.tf
+python3 -m infrarig.dsl.cli infrarig/examples/basic/basic.rig
+python3 -m infrarig.dsl.cli infrarig/examples/named/named.rig -o /tmp/named.tf
 ```
 
 Errors from lexing, parsing or codegen go to stderr with a non-zero exit code.
@@ -146,8 +218,8 @@ these from inside the checkout:
 
 ```bash
 tools/build.sh
-output/rig examples/basic.rig
-output/rig examples/named.rig -o /tmp/named.tf
+output/rig examples/basic/basic.rig
+output/rig examples/named/named.rig -o /tmp/named.tf
 ```
 
 By default the executable is written to `output/rig` in the checkout
@@ -174,14 +246,15 @@ If `~/.local/bin` isn't on your `PATH` yet, add
 
 ## Examples
 
-- [examples/basic.rig](examples/basic.rig): one server reading and
+- [examples/basic](examples/basic): one server reading and
   writing one bucket, using bare type refs.
-- [examples/named.rig](examples/named.rig): multiple resources of the
+- [examples/named](examples/named): multiple resources of the
   same type, referenced by name.
+- [examples/multiregion](examples/multiregion): an app and its bucket,
+  declared once and copied to a second region with a `Component`.
 
 The tests in [tests/test_codegen.py](tests/test_codegen.py) cover the
-other types: multi-region, shared roles, `Registry`, `Secret` and
-replication.
+other types: `Registry`, `Secret` and one-way replication.
 
 ## Layout
 
@@ -189,13 +262,15 @@ replication.
 infrarig/
   dsl/
     lexer.py       # source -> tokens
-    parser.py      # tokens -> AST (ResourceDecl / RelationStmt)
+    parser.py      # tokens -> AST (ResourceDecl / RelationStmt / ComponentDecl)
     ast_nodes.py   # AST dataclasses
+    components.py  # expands Component mirrors into plain resources/relations
     codegen.py     # AST -> HCL string
+    errors.py      # CodegenError
     cli.py         # `python3 -m infrarig.dsl.cli <file.rig>`
   tools/
     build.sh       # builds <output-dir>/rig, default output/rig
-  examples/        # sample .rig programs
+  examples/<name>/ # sample .rig programs, each with a README
   tests/           # unittest suite for lexer/parser/codegen
 ```
 
